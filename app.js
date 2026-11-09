@@ -158,18 +158,11 @@ function buildRoomUI(room) {
   const ui = {};
   const el = room.el;
 
-  // header: dot + share ... role · count + close
+  // header: share ... dot + count + close
   const header = h('div');
   header.className = 'room-header';
   const left = h('span');
   left.className = 'header-left';
-  ui.dot = h('span');
-  ui.dot.style.display = 'inline-block';
-  ui.dot.style.width = '10px';
-  ui.dot.style.height = '10px';
-  ui.dot.style.borderRadius = '50%';
-  ui.dot.style.verticalAlign = 'middle';
-  left.appendChild(ui.dot);
   ui.shareBtn = h('button', 'share link');
   ui.shareBtn.className = 'share-btn';
   ui.shareBtn.title = 'copies an invite link that auto-joins this room';
@@ -178,12 +171,14 @@ function buildRoomUI(room) {
   header.appendChild(left);
   const right = h('span');
   right.className = 'header-right';
-  if (room.role === 'host') {
-    const role = h('span', 'hosting');
-    role.className = 'room-role';
-    right.appendChild(role);
-    right.appendChild(h('span', '·'));
-  }
+  // status dot sits immediately left of the online count
+  ui.dot = h('span');
+  ui.dot.style.display = 'inline-block';
+  ui.dot.style.width = '10px';
+  ui.dot.style.height = '10px';
+  ui.dot.style.borderRadius = '50%';
+  ui.dot.style.verticalAlign = 'middle';
+  right.appendChild(ui.dot);
   ui.memberCount = h('span');
   ui.memberCount.className = 'member-count';
   right.appendChild(ui.memberCount);
