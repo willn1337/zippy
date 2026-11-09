@@ -47,7 +47,6 @@ h1, h4 {
   font-size: 13px;
   padding: 2px 8px;
   cursor: pointer;
-  margin-left: 6px;
 }
 
 .header-right {
@@ -77,7 +76,7 @@ h1, h4 {
 }
 
 
-/* the one status line (transfer results, folder info) — the dot is connection-only */
+/* the one status line (transfer results, folder info) - the dot is connection-only */
 .room-status {
   font-size: 0.9em;
   margin-top: 6px;
@@ -164,7 +163,7 @@ h1, h4 {
 }
 /* empty list must not take vertical space */
 .transfers-list:empty { display: none; }
-/* .room-box button resets padding/font with higher specificity — keep the
+/* .room-box button resets padding/font with higher specificity - keep the
    cancel button's own metrics (see .room-box button above) */
 .room-box .cancel-btn {
   font-size: 16px;

@@ -1,18 +1,18 @@
 'use strict';
 
 // ------------------------------ config ---------------------------------
-const NS       = 'p2pdrop_';        // peer-id namespace
-const CHUNK    = 64 * 1024;         // 64 KB wire chunks
+const NS = 'p2pdrop_';        // peer-id namespace
+const CHUNK = 64 * 1024;         // 64 KB wire chunks
 const BUF_HIGH = 1024 * 1024;       // pause sender above 1 MB buffered
-const BUF_LOW  = 256 * 1024;        // drain() resumes below this
+const BUF_LOW = 256 * 1024;        // drain() resumes below this
 const RETRY_MS = 30000;             // member host-retry interval
-const LS_KEY   = 'zippy.rooms';
+const LS_KEY = 'zippy.rooms';
 const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L
 const PEER_OPTS = {
   debug: 1,
   config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
 };
-// PeerJS treats these signaling errors as fatal (peer destroyed) —
+// PeerJS treats these signaling errors as fatal (peer destroyed) -
 // the only cure is building a fresh peer instance
 const FATAL_SIGNALING = ['network', 'socket-error', 'socket-closed-error', 'server-error', 'ssl-unavailable'];
 // status-dot colors: ok / working on it / broken
@@ -23,7 +23,7 @@ const IS_FIREFOX = /firefox|fxios/i.test(navigator.userAgent);
 const rooms = new Map();        // roomId -> room record
 const roomFolders = new Map();  // roomId -> FileSystemDirectoryHandle
 
-const roomsEl  = document.getElementById('rooms');
+const roomsEl = document.getElementById('rooms');
 const compatEl = document.getElementById('compat');
 
 // --------------------------- tiny helpers ------------------------------
@@ -64,12 +64,12 @@ function safeSend(conn, data) {
 // --------------------------- persistence -------------------------------
 function saveRooms() {
   const list = [...rooms.values()].map((r) => ({ id: r.id, role: r.role }));
-  try { localStorage.setItem(LS_KEY, JSON.stringify(list)); } catch {}
+  try { localStorage.setItem(LS_KEY, JSON.stringify(list)); } catch { }
 }
 
 function loadRooms() {
   let list = [];
-  try { list = JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch {}
+  try { list = JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch { }
   for (const r of list) {
     if (!r || !/^[A-Z0-9]{5}$/.test(r.id || '')) continue;
     if (rooms.has(r.id)) continue;
@@ -115,7 +115,7 @@ function baseRoom(id, role, restored) {
 }
 
 function setConn(room, text, level) {
-  // CONNECTION status only — drives the colored dot + its tooltip
+  // CONNECTION status only - drives the colored dot + its tooltip
   room.status = text;
   if (level) room.level = level;
   room.ui.dot.style.background = LEVEL_COLORS[room.level];
@@ -153,7 +153,7 @@ function updateFolderLabel(room) {
 }
 
 // Build the whole card once: header / status line / dropzone / transfers /
-// footer. Everything later mutates room.ui.* directly — no innerHTML wipes.
+// footer. Everything later mutates room.ui.* directly - no innerHTML wipes.
 function buildRoomUI(room) {
   const ui = {};
   const el = room.el;
@@ -187,14 +187,14 @@ function buildRoomUI(room) {
   x.title = room.role === 'host' ? 'delete room' : 'leave room';
   x.addEventListener('click', () => {
     if (room.role === 'host' &&
-        !confirm('Delete room ' + room.id + '? Connected members will be kicked.')) return;
+      !confirm('Delete room ' + room.id + '? Connected members will be kicked.')) return;
     destroyRoom(room);
   });
   right.appendChild(x);
   header.appendChild(right);
   el.appendChild(header);
 
-  // single status line (transfer results, folder problems — never the
+  // single status line (transfer results, folder problems - never the
   // connection state, that is the dot's job)
   ui.status = h('div');
   ui.status.className = 'room-status';
@@ -258,7 +258,7 @@ function buildRoomUI(room) {
     footer.appendChild(link);
   } else {
     const note = h('span', '📁 browser downloads');
-    note.title = 'no File System Access API — incoming files use browser downloads';
+    note.title = 'no File System Access API - incoming files use browser downloads';
     footer.appendChild(note);
   }
   el.appendChild(footer);
@@ -300,10 +300,10 @@ function hostError(room, err) {
       room.spawnTries++;
       if (room.restored) {
         // the old registration may linger on the cloud server for a bit
-        setConn(room, 'code still registered from last session — retrying...');
+        setConn(room, 'code still registered from last session - retrying...');
         setTimeout(() => {
           if (room.destroyed) return;
-          try { room.peer.destroy(); } catch {}
+          try { room.peer.destroy(); } catch { }
           spawnHostPeer(room);
         }, 5000);
       } else {
@@ -311,7 +311,7 @@ function hostError(room, err) {
       }
       return;
     }
-    setConn(room, 'code already in use — remove this room and host again', 'err');
+    setConn(room, 'code already in use - remove this room and host again', 'err');
     return;
   }
   if (err.type === 'peer-unavailable') return; // stale offer, ignore
@@ -323,7 +323,7 @@ function hostError(room, err) {
     rebuildPeer(room, 'signaling unreachable (' + err.type + ')');
     return;
   }
-  setConn(room, 'signaling problem (' + err.type + ') — retrying...', 'warn');
+  setConn(room, 'signaling problem (' + err.type + ') - retrying...', 'warn');
 }
 
 function rekeyHost(room) {
@@ -334,7 +334,7 @@ function rekeyHost(room) {
   room.id = genId();
   if (folder) roomFolders.set(room.id, folder);
   rooms.set(room.id, room);
-  try { room.peer.destroy(); } catch {}
+  try { room.peer.destroy(); } catch { }
   spawnHostPeer(room);
   saveRooms();
 }
@@ -370,15 +370,15 @@ function broadcastMembers(room) {
 // host. The lower peer id dials, the higher one accepts, so each pair has
 // exactly one connection.
 function attachPeerConn(room, conn) {
-  if (room.destroyed) { try { conn.close(); } catch {} return; }
+  if (room.destroyed) { try { conn.close(); } catch { } return; }
   const pid = conn.peer;
-  if (!pid || pid === (room.peer && room.peer.id)) { try { conn.close(); } catch {} return; }
-  if (pid === NS + room.id) { try { conn.close(); } catch {} return; } // already the host link
+  if (!pid || pid === (room.peer && room.peer.id)) { try { conn.close(); } catch { } return; }
+  if (pid === NS + room.id) { try { conn.close(); } catch { } return; } // already the host link
   const existing = room.conns.get(pid);
   if (existing) {
-    if (existing.open) { try { conn.close(); } catch {} return; }
+    if (existing.open) { try { conn.close(); } catch { } return; }
     room.conns.delete(pid);
-    try { existing.close(); } catch {}
+    try { existing.close(); } catch { }
     cleanupConn(room, existing);
   }
   room.conns.set(pid, conn);
@@ -419,7 +419,7 @@ function syncPeerList(room, peers) {
   for (const [pid, conn] of [...room.conns]) {
     if (!room.peerList.has(pid)) {
       room.conns.delete(pid);
-      try { conn.close(); } catch {}
+      try { conn.close(); } catch { }
       cleanupConn(room, conn);
     }
   }
@@ -436,7 +436,7 @@ function meshTick(room) {
       if (existing.open) continue;
       if (Date.now() - (existing._born || 0) < 15000) continue; // still dialing
       room.conns.delete(pid);
-      try { existing.close(); } catch {}
+      try { existing.close(); } catch { }
       cleanupConn(room, existing);
     }
     if (self < pid) connectPeer(room, pid);
@@ -450,7 +450,7 @@ function clearPeerConns(room) {
   room.conns.clear();
   room.conn = null;
   for (const c of all) {
-    try { c.close(); } catch {} // handlers may skip on purpose: room.conn was nulled
+    try { c.close(); } catch { } // handlers may skip on purpose: room.conn was nulled
     cleanupConn(room, c);
   }
 }
@@ -494,23 +494,23 @@ function spawnMemberPeer(room) {
     }
     if (FATAL_SIGNALING.indexOf(err.type) !== -1) {
       // the Peer is destroyed; the 30 s retry timer rebuilds it
-      setConn(room, 'signaling unreachable (' + err.type + ') — retrying...', 'warn');
+      setConn(room, 'signaling unreachable (' + err.type + ') - retrying...', 'warn');
       return;
     }
-    setConn(room, 'signaling problem (' + err.type + ') — retrying...', 'warn');
+    setConn(room, 'signaling problem (' + err.type + ') - retrying...', 'warn');
   });
 }
 
 function connectHost(room) {
   if (room.destroyed) return;
-  if (room.conn) { try { room.conn.close(); } catch {} room.conn = null; }
+  if (room.conn) { try { room.conn.close(); } catch { } room.conn = null; }
   setConn(room, 'connecting to host...', 'warn');
   const conn = room.peer.connect(NS + room.id, { reliable: true });
   room.conn = conn;
   conn.on('open', () => {
-    if (room.conn !== conn) { try { conn.close(); } catch {} return; } // stale
+    if (room.conn !== conn) { try { conn.close(); } catch { } return; } // stale
     prepChannel(conn);
-    setLevel(room, 'ok'); // connected — the dropzone says the rest
+    setLevel(room, 'ok'); // connected - the dropzone says the rest
   });
   conn.on('data', (d) => enqueueData(room, conn, d));
   conn.on('close', () => {
@@ -530,7 +530,7 @@ function connectHost(room) {
 function onPeerDisconnected(room) {
   if (room.destroyed) return;
   setConn(room, 'signaling reconnecting...', 'warn');
-  try { room.peer.reconnect(); } catch {}
+  try { room.peer.reconnect(); } catch { }
 }
 
 // PeerJS marks signaling failures (VPN, firewall, offline) as FATAL: the
@@ -542,8 +542,8 @@ function rebuildPeer(room, why) {
   const now = Date.now();
   if (now - (room.lastRebuild || 0) < 1000) return; // debounce error storms
   room.lastRebuild = now;
-  setConn(room, why + ' — rebuilding connection...', 'warn');
-  try { room.peer && room.peer.destroy(); } catch {}
+  setConn(room, why + ' - rebuilding connection...', 'warn');
+  try { room.peer && room.peer.destroy(); } catch { }
   if (room.role === 'host') spawnHostPeer(room);
   else spawnMemberPeer(room);
 }
@@ -556,7 +556,7 @@ function prepChannel(conn) {
 // --------------------------- file sending ------------------------------
 let batchSeq = 0; // unique folder-batch id (one per drop, shared by all peers)
 
-// Every send is a batch — a single file is just a batch of one. Folder
+// Every send is a batch - a single file is just a batch of one. Folder
 // batches additionally tag the wire with bid/batch/bsize/count and end
 // with a single {type:'batch-end'}.
 function queueSend(room, file) {
@@ -596,7 +596,7 @@ function queueFolder(room, root, entries) {
 function queueBatch(room, batch) {
   const targets = openConns(room);
   if (!targets.length) {
-    setStatus(room, 'nobody connected — "' + batch.label + '" not sent', 'warn');
+    setStatus(room, 'nobody connected - "' + batch.label + '" not sent', 'warn');
     return;
   }
   for (const conn of targets) {
@@ -662,7 +662,7 @@ async function walkEntry(entry, rel, out) {
   if (!entry.isDirectory) return;
   const reader = entry.createReader();
   const children = [];
-  for (;;) {
+  for (; ;) {
     const batch = await new Promise((resolve) =>
       reader.readEntries(resolve, () => resolve([])));
     if (!batch.length) break;
@@ -731,7 +731,7 @@ async function sendBatch(room, conn, batch, xf) {
       meta.count = batch.entries.length;
     }
     if (!safeSend(conn, meta)) {
-      return failSend(room, conn, xf, 'failed — connection closed');
+      return failSend(room, conn, xf, 'failed - connection closed');
     }
     let offset = 0;
     while (offset < entry.file.size) {
@@ -792,8 +792,8 @@ function drain(conn) {
 // -------------------------- file receiving -----------------------------
 function isBinary(d) {
   return d instanceof ArrayBuffer ||
-         ArrayBuffer.isView(d) ||
-         (typeof Blob !== 'undefined' && d instanceof Blob);
+    ArrayBuffer.isView(d) ||
+    (typeof Blob !== 'undefined' && d instanceof Blob);
 }
 
 // PeerJS fires 'data' in order, but onData() awaits (Blob reassembly, disk
@@ -838,8 +838,8 @@ async function onData(room, conn, data) {
         updateHeader(room);
         return;
       }
-      if (data.type === 'meta')    { await startReceive(room, conn, data); return; }
-      if (data.type === 'done')    { await finishReceive(room, conn); return; }
+      if (data.type === 'meta') { await startReceive(room, conn, data); return; }
+      if (data.type === 'done') { await finishReceive(room, conn); return; }
       if (data.type === 'batch-end') { finishBatch(room, conn, data.bid); return; }
       if (data.type === 'cancel') {
         // the peer cancelled a transfer; the direction tells us which one:
@@ -882,8 +882,8 @@ function sanitizeParts(path) {
 }
 
 async function entryExists(dir, name) {
-  try { await dir.getFileHandle(name); return true; } catch {}
-  try { await dir.getDirectoryHandle(name); return true; } catch {}
+  try { await dir.getFileHandle(name); return true; } catch { }
+  try { await dir.getDirectoryHandle(name); return true; } catch { }
   return false;
 }
 
@@ -919,7 +919,7 @@ async function uniqueDirName(dir, name, reserved) {
 // remove a partial incoming folder; safe on a tree that was never created
 async function dropBatchTree(b) {
   if (!b || !b.parent || !b.actualRoot) return;
-  try { await b.parent.removeEntry(b.actualRoot, { recursive: true }); } catch {}
+  try { await b.parent.removeEntry(b.actualRoot, { recursive: true }); } catch { }
   b.dirHandle = null;
 }
 
@@ -988,7 +988,7 @@ async function startReceive(room, conn, meta) {
     st.xf.conn = conn;
     st.xf.state = 'active';
   }
-  // register BEFORE the awaits below — chunks can arrive immediately
+  // register BEFORE the awaits below - chunks can arrive immediately
   room.recvStates.set(conn, st);
 
   const dir = roomFolders.get(room.id);
@@ -1000,18 +1000,17 @@ async function startReceive(room, conn, meta) {
     if (!window.showDirectoryPicker) {
       const huge = size > 2 * 1024 * 1024 * 1024; // 2 GB: risky in a tab
       setStatus(room,
-        'no direct-to-disk API — "' + name + '" (' + fmtBytes(size) + ') is buffered in memory' +
-        (huge
-          ? ' and may crash the tab; use Chrome/Edge to stream it straight to disk'
-          : ', then saved through a normal browser download'),
+        '"' + name + '" (' + fmtBytes(size) + ')' + (huge
+          ? ' may crash this tab - use Chrome or Edge for big files'
+          : ' will download when it arrives'),
         huge ? 'warn' : undefined);
     } else if (b) {
       if (!b.noticeShown) {
         b.noticeShown = true;
-        setStatus(room, 'no output folder — "' + b.root + '" will arrive as separate browser downloads', 'warn');
+        setStatus(room, 'no output folder - "' + b.root + '" will arrive as separate browser downloads', 'warn');
       }
     } else {
-      setStatus(room, 'no output folder — "' + name + '" will save through a browser download; click "choose output folder" below the dropzone to stream to disk', 'warn');
+      setStatus(room, 'no output folder - "' + name + '" will download instead; pick a folder below to save big files safely', 'warn');
     }
     return;
   }
@@ -1035,7 +1034,7 @@ async function startReceive(room, conn, meta) {
     const fh = await targetDir.getFileHandle(targetName, { create: true });
     const writable = await fh.createWritable(); // streams straight to disk
     if (!st.open) {
-      try { await writable.abort(); } catch {}
+      try { await writable.abort(); } catch { }
       if (b) await dropBatchTree(b); // cancelled while we were opening it
       return;
     }
@@ -1088,7 +1087,7 @@ async function receiveChunk(room, conn, buf) {
       if (st.batch) msg.bid = st.batch.bid;
       safeSend(conn, msg); // stop the sender
     }
-    if (st.writable) { try { await st.writable.abort(); } catch {} st.writable = null; }
+    if (st.writable) { try { await st.writable.abort(); } catch { } st.writable = null; }
     st.chunks = null;
     st.pending = [];
     st.xf.state = 'failed';
@@ -1106,7 +1105,7 @@ async function finishReceive(room, conn) {
   if (st.drop) return; // leftovers from a folder we already dropped
   if (st.writable) {
     // extremely unlikely: a chunk landed while startReceive was flushing
-    for (const buf of st.pending) { try { await st.writable.write(buf); } catch {} }
+    for (const buf of st.pending) { try { await st.writable.write(buf); } catch { } }
     st.pending = [];
     try {
       await st.writable.close();
@@ -1164,7 +1163,7 @@ async function abortIncoming(room, conn, why) {
   st.pending = [];
   st.chunks = null;
   if (st.writable) {
-    try { await st.writable.abort(); } catch {} // does not keep the partial
+    try { await st.writable.abort(); } catch { } // does not keep the partial
     st.writable = null;
   }
   if (st.xf && !st.batch && st.xf.state !== 'done') {
@@ -1406,9 +1405,9 @@ function destroyRoom(room) {
   room.destroyed = true;
   clearInterval(room.retryTimer);
   clearInterval(room.meshTimer);
-  for (const c of room.conns.values()) { try { c.close(); } catch {} }
-  if (room.conn) { try { room.conn.close(); } catch {} }
-  if (room.peer) { try { room.peer.destroy(); } catch {} }
+  for (const c of room.conns.values()) { try { c.close(); } catch { } }
+  if (room.conn) { try { room.conn.close(); } catch { } }
+  if (room.peer) { try { room.peer.destroy(); } catch { } }
   rooms.delete(room.id);
   roomFolders.delete(room.id);
   saveRooms();
@@ -1426,7 +1425,7 @@ async function pickFolder() {
 }
 
 document.getElementById('btn-host').addEventListener('click', async () => {
-  if (typeof Peer === 'undefined') { alert('PeerJS failed to load — check your connection.'); return; }
+  if (typeof Peer === 'undefined') { alert('PeerJS failed to load - check your connection.'); return; }
   // the directory picker MUST run inside this direct click handler
   // (File System Access API user-gesture requirement)
   const folder = await pickFolder();
@@ -1434,7 +1433,7 @@ document.getElementById('btn-host').addEventListener('click', async () => {
   createHost(genId(), folder, false);
 });
 
-// restore persisted rooms on load (folder handles can't be persisted —
+// restore persisted rooms on load (folder handles can't be persisted -
 // set them again via the footer link; all picker calls stay inside
 // direct click handlers)
 loadRooms();
@@ -1464,14 +1463,10 @@ if (!window.showDirectoryPicker) {
   if (IS_FIREFOX) {
     compatEl.className = 'compat-warn';
     compatEl.textContent =
-      'warning: Firefox cannot stream incoming files straight to disk. They are buffered ' +
-      'in memory and then downloaded, so large files (multi-GB) may crash the tab — use ' +
-      'Chrome or Edge for big transfers.';
+      'warning: Firefox may crash on very large incoming files - use Chrome or Edge for those.';
   } else {
     compatEl.textContent =
-      'note: this browser lacks the File System Access API (Chrome/Edge have it). ' +
-      'Incoming files are buffered in memory and then saved through a normal browser ' +
-      'download, so very large files can run out of memory. Chrome/Edge stream straight ' +
-      'to a folder you pick instead.';
+      'note: this browser can\'t save incoming files straight to a folder, so very large ' +
+      'files may run out of memory. Chrome or Edge handle big files better.';
   }
 }
