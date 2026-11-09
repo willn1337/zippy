@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>zippy</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>zippy</h1>
+  <p>
+    Hamachi-style P2P file drops. Host a room, share the 5-letter code, drop files —
+    straight between browsers, no server in the middle. Direct-to-disk saving needs
+    Chrome or Edge; other browsers fall back to normal downloads.
+  </p>
+  <p>
+    <button id="btn-host">HOST</button>
+    <button id="btn-join">JOIN</button>
+  </p>
+  <div id="rooms"></div>
+  <p id="compat"></p>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
