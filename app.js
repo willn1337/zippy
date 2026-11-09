@@ -1,22 +1,5 @@
 'use strict';
 
-/* =======================================================================
-   zippy — hamachi-style P2P file drop (single peer per room)
-   -----------------------------------------------------------------------
-   - a PeerJS instance has exactly ONE id, so multi-room = multiple peers:
-       host   -> new Peer('p2pdrop_' + id)   (is the hub of that room)
-       member -> new Peer()                  (temporary client peer)
-   - wire protocol per DataConnection (strictly sequential):
-       1) { type: 'meta', name, size }     JSON object
-       2) raw ArrayBuffer chunks, 64 KB    (file.slice, never full file)
-       3) { type: 'done' }                 JSON object
-   - backpressure: pause when dataChannel.bufferedAmount > 1 MB, resume
-     on the 'bufferedamountlow' event
-   - resilience: signaling loss (VPN, offline, firewall) is FATAL in
-     PeerJS — a watchdog + fatal-error handler rebuild the peer until
-     signaling comes back
-   ======================================================================= */
-
 // ------------------------------ config ---------------------------------
 const NS       = 'p2pdrop_';        // peer-id namespace
 const CHUNK    = 64 * 1024;         // 64 KB wire chunks
@@ -32,6 +15,9 @@ const PEER_OPTS = {
 // PeerJS treats these signaling errors as fatal (peer destroyed) —
 // the only cure is building a fresh peer instance
 const FATAL_SIGNALING = ['network', 'socket-error', 'socket-closed-error', 'server-error', 'ssl-unavailable'];
+// status-dot colors: ok / working on it / broken
+const LEVEL_COLORS = { ok: '#2da44e', warn: '#eab308', err: '#cf222e' };
+const IS_FIREFOX = /firefox|fxios/i.test(navigator.userAgent);
 
 // ------------------------------ state ----------------------------------
 const rooms = new Map();        // roomId -> room record
@@ -56,10 +42,6 @@ function genId() {
     }
   } while (rooms.has(id));
   return id;
-}
-
-function shortId(pid) {
-  return String(pid || '').replace(/[^a-zA-Z0-9]/g, '').slice(-4) || '????';
 }
 
 function fmtBytes(n) {
@@ -105,21 +87,34 @@ function baseRoom(id, role, restored) {
     peer: null,
     conns: new Map(),       // host: peerId -> DataConnection
     conn: null,             // member: DataConnection to host
-    labels: new Map(),      // host: peerId -> display label
-    members: [],            // member list for display
-    recvStates: new Map(),  // conn -> incoming transfer state
-    xfers: new Map(),       // display key -> progress line
-    xferEls: new Map(),     // display key -> <div>
-    sendQueue: [],
-    sendBusy: false,
+    memberCount: 1,         // online in this room (including you)
+    recvStates: new Map(),  // conn -> incoming file state
+    recvBatches: new Map(), // conn -> current incoming folder batch
+    recvRoots: new Set(),   // folder roots already used on disk this session
+    recvChains: new Map(),  // conn -> promise: strict in-order data handling
+    peerList: new Set(),    // member: peer ids of everyone else in the room
+    xfers: new Map(),       // transfer id -> transfer record
+    xferEls: new Map(),     // transfer id -> .transfer-item <div>
+    sendQueues: new Map(),  // conn -> [{ file, xf }] (serialized per conn)
+    sending: new Set(),     // conns with an active send pump
+    sendingByConn: new Map(), // conn -> active outgoing xf
     retryTimer: 0,
+    meshTimer: 0,
     watchdog: 0,
     reconnectPending: false,
     revivePending: false,
     bornAt: 0,              // performance.now() of the last peer spawn
     spawnTries: 0,
     status: 'Starting...',
-    statusEl: null,
+    level: 'warn',          // 'ok' | 'warn' | 'err' → status-dot color
+    copiedUntil: 0,         // share button shows "copied!" until this timestamp
+    copyOk: true,
+    noticeText: '',         // non-connection message shown under the header
+    noticeLevel: '',        // 'ok' | 'warn' | 'err' (notice line only)
+    noticeUntil: 0,
+    noticeTimer: 0,
+    noticeEl: null,
+    dotEl: null,
     progEl: null,
     destroyed: false,
   };
@@ -129,78 +124,128 @@ function baseRoom(id, role, restored) {
   return room;
 }
 
-function setStatus(room, text) {
+function setConn(room, text, level) {
+  // CONNECTION status only — drives the colored dot + its tooltip
   room.status = text;
-  if (room.statusEl && room.statusEl.isConnected) {
-    room.statusEl.textContent = 'status: ' + text;
+  if (level) room.level = level;
+  if (room.dotEl && room.dotEl.isConnected) {
+    room.dotEl.style.background = LEVEL_COLORS[room.level];
+    room.dotEl.title = room.status;
+  }
+}
+
+function renderNotice(room) {
+  const el = room.noticeEl;
+  if (!el) return;
+  const live = room.noticeText && Date.now() < room.noticeUntil;
+  el.textContent = live ? room.noticeText : '';
+  el.className = 'room-notice' + (live && room.noticeLevel ? ' ' + room.noticeLevel : '');
+}
+
+// everything that is NOT connection state: folder problems, transfer
+// warnings/results. Shown in the card's notice line, auto-clears.
+function setNotice(room, text, level, ms) {
+  clearTimeout(room.noticeTimer);
+  room.noticeText = text || '';
+  room.noticeLevel = level || '';
+  room.noticeUntil = text ? Date.now() + (ms || 6000) : 0;
+  renderNotice(room);
+  if (text) {
+    room.noticeTimer = setTimeout(() => {
+      if (room.destroyed || Date.now() < room.noticeUntil) return;
+      room.noticeText = '';
+      room.noticeLevel = '';
+      renderNotice(room);
+    }, (ms || 6000) + 50);
+  }
+}
+
+// healthy/idle state: color the dot, clear the tooltip text
+function setLevel(room, level) {
+  room.status = '';
+  room.level = level;
+  if (room.dotEl && room.dotEl.isConnected) {
+    room.dotEl.style.background = LEVEL_COLORS[level];
+    room.dotEl.title = '';
   }
 }
 
 function openConns(room) {
-  if (room.role === 'host') return [...room.conns.values()].filter((c) => c.open);
-  return room.conn && room.conn.open ? [room.conn] : [];
-}
-
-function memberDisplay(room) {
-  const mine = room.peer ? 'm-' + shortId(room.peer.id) : '';
-  return room.members.map((m) => {
-    if (m === 'host') return room.role === 'host' ? 'host (you)' : 'host';
-    if (m === mine) return m + ' (you)';
-    return m;
-  });
+  const list = [];
+  if (room.role === 'member' && room.conn && room.conn.open) list.push(room.conn);
+  for (const c of room.conns.values()) if (c.open) list.push(c);
+  return list;
 }
 
 function renderRoom(room) {
   const el = room.el;
   el.textContent = '';
 
-  // line 1: room code (blurred, click to copy) + role + remove
-  const top = h('div');
-  top.appendChild(document.createTextNode('room '));
-  const code = h('span', room.id);
-  code.className = 'hidden-id';
-  code.title = 'hover to reveal — click to copy';
-  code.addEventListener('click', () => copyId(room));
-  top.appendChild(code);
-  top.appendChild(document.createTextNode('   '));
-  top.appendChild(h('strong', room.role === 'host' ? '[HOST]' : '[MEMBER]'));
-  top.appendChild(document.createTextNode('   '));
-  const rm = h('button', 'remove');
-  rm.addEventListener('click', () => destroyRoom(room));
-  top.appendChild(rm);
-  el.appendChild(top);
-
-  // line 2: output folder
-  const dir = roomFolders.get(room.id);
-  const fl = h('div');
-  if (!window.showDirectoryPicker) {
-    fl.textContent = 'folder: n/a (browser will download incoming files)';
-  } else {
-    fl.appendChild(document.createTextNode('folder: ' + (dir ? dir.name : 'none selected') + ' '));
-    const cf = h('button', 'change folder');
-    cf.addEventListener('click', () => changeFolder(room));
-    fl.appendChild(cf);
+  // header: dot + share ... role · count + close
+  const header = h('div');
+  header.className = 'room-header';
+  const left = h('span');
+  left.className = 'header-left';
+  const dot = h('span');
+  dot.style.display = 'inline-block';
+  dot.style.width = '10px';
+  dot.style.height = '10px';
+  dot.style.borderRadius = '50%';
+  dot.style.background = LEVEL_COLORS[room.level];
+  dot.style.verticalAlign = 'middle';
+  dot.title = room.status; // hover for details
+  room.dotEl = dot;
+  left.appendChild(dot);
+  const share = h('button', room.copiedUntil > Date.now()
+    ? (room.copyOk ? 'copied!' : 'copy failed')
+    : 'share link');
+  share.className = 'share-btn';
+  share.title = 'copies an invite link that auto-joins this room';
+  share.addEventListener('click', () => copyId(room));
+  left.appendChild(share);
+  header.appendChild(left);
+  const right = h('span');
+  right.className = 'header-right';
+  if (room.role === 'host') {
+    const role = h('span', 'hosting');
+    role.className = 'room-role';
+    right.appendChild(role);
+    right.appendChild(h('span', '·'));
   }
-  el.appendChild(fl);
+  const count = h('span', room.memberCount + ' online');
+  count.className = 'member-count';
+  right.appendChild(count);
+  const x = h('button', '×');
+  x.className = 'close-btn';
+  x.title = room.role === 'host' ? 'delete room' : 'leave room';
+  x.addEventListener('click', () => {
+    if (room.role === 'host' &&
+        !confirm('Delete room ' + room.id + '? Connected members will be kicked.')) return;
+    destroyRoom(room);
+  });
+  right.appendChild(x);
+  header.appendChild(right);
+  el.appendChild(header);
 
-  // line 3: members
-  const names = memberDisplay(room);
-  el.appendChild(h('div', 'members (' + names.length + '): ' + (names.join(', ') || '—')));
+  // non-connection messages live here — never on the status dot
+  room.noticeEl = h('div');
+  room.noticeEl.className = 'room-notice';
+  el.appendChild(room.noticeEl);
+  renderNotice(room);
 
-  // line 4: status
-  room.statusEl = h('div', 'status: ' + room.status);
-  el.appendChild(room.statusEl);
-
-  // dropzone
-  const peers = openConns(room).length;
-  const dz = h('div', peers
-    ? 'drop file here to send to ' + peers + ' peer' + (peers > 1 ? 's' : '') + ' (or click)'
-    : 'drop file here (nobody connected yet)');
+  // dropzone: files and folders (drop either, or click either line)
+  const dz = h('div');
   dz.className = 'drop-zone';
+  const dzMain = h('span', 'upload files');
+  dzMain.className = 'drop-main';
+  const dzSub = h('span', 'or pick a folder');
+  dzSub.className = 'drop-sub';
+  dz.appendChild(dzMain);
+  dz.appendChild(dzSub);
   dz.addEventListener('dragover', (e) => e.preventDefault());
   dz.addEventListener('drop', (e) => {
     e.preventDefault();
-    if (e.dataTransfer) for (const f of e.dataTransfer.files) queueSend(room, f);
+    if (e.dataTransfer) queueDrop(room, e.dataTransfer);
   });
   const fi = document.createElement('input');
   fi.type = 'file';
@@ -210,14 +255,53 @@ function renderRoom(room) {
     for (const f of fi.files) queueSend(room, f);
     fi.value = '';
   });
+  const di = document.createElement('input');
+  di.type = 'file';
+  di.multiple = true;
+  di.hidden = true;
+  if ('webkitdirectory' in di) di.webkitdirectory = true;
+  else dzSub.style.display = 'none'; // no folder picker in this browser
+  di.addEventListener('change', () => {
+    sendPickedFolder(room, di.files);
+    di.value = '';
+  });
   dz.addEventListener('click', () => fi.click());
+  dzSub.addEventListener('click', (e) => { e.stopPropagation(); di.click(); });
   el.appendChild(dz);
   el.appendChild(fi);
+  el.appendChild(di);
 
-  // progress lines (kept fresh by the ticker)
+  // transfers (Drive-style list): below the dropzone, above the folder link
   room.progEl = h('div');
+  room.progEl.className = 'transfers-list';
   room.xferEls.clear();
   el.appendChild(room.progEl);
+  for (const xf of room.xfers.values()) {
+    const item = buildTransferItem(room, xf);
+    room.progEl.appendChild(item);
+    room.xferEls.set(xf.id, item);
+  }
+
+  // footer: folder config (click the link to pick a folder)
+  const footer = h('div');
+  footer.className = 'room-footer';
+  const dir = roomFolders.get(room.id);
+  if (window.showDirectoryPicker) {
+    const link = h('span');
+    link.className = 'folder-link';
+    link.appendChild(h('span', '📁'));
+    link.appendChild(document.createTextNode(' '));
+    const label = h('span', dir ? dir.name : 'choose output folder');
+    label.className = 'folder-text';
+    link.appendChild(label);
+    link.addEventListener('click', () => changeFolder(room));
+    footer.appendChild(link);
+  } else {
+    const note = h('span', '📁 browser downloads');
+    note.title = 'no File System Access API — incoming files use browser downloads';
+    footer.appendChild(note);
+  }
+  el.appendChild(footer);
 }
 
 // ------------------------------- host ----------------------------------
@@ -232,11 +316,12 @@ function createHost(id, folder, restored) {
 }
 
 function spawnHostPeer(room) {
+  clearPeerConns(room);
   const peer = new Peer(NS + room.id, PEER_OPTS);
   room.peer = peer;
   room.bornAt = performance.now();
   peer.on('open', () => {
-    setStatus(room, 'host online — share the room code');
+    setLevel(room, 'ok'); // host online
   });
   peer.on('connection', (conn) => attachHostConn(room, conn));
   peer.on('disconnected', () => scheduleReconnect(room));
@@ -250,7 +335,7 @@ function hostError(room, err) {
       room.spawnTries++;
       if (room.restored) {
         // the old registration may linger on the cloud server for a bit
-        setStatus(room, 'code still registered from last session — retrying...');
+        setConn(room, 'code still registered from last session — retrying...');
         setTimeout(() => {
           if (room.destroyed) return;
           try { room.peer.destroy(); } catch {}
@@ -261,19 +346,19 @@ function hostError(room, err) {
       }
       return;
     }
-    setStatus(room, 'code already in use — remove this room and host again');
+    setConn(room, 'code already in use — remove this room and host again', 'err');
     return;
   }
   if (err.type === 'peer-unavailable') return; // stale offer, ignore
   if (err.type === 'browser-incompatible') {
-    setStatus(room, 'FATAL: browser lacks WebRTC support');
+    setConn(room, 'FATAL: browser lacks WebRTC support', 'err');
     return;
   }
   if (FATAL_SIGNALING.indexOf(err.type) !== -1) {
     scheduleRevive(room, 'signaling unreachable (' + err.type + ')');
     return;
   }
-  setStatus(room, 'signaling problem (' + err.type + ') — retrying...');
+  setConn(room, 'signaling problem (' + err.type + ') — retrying...', 'warn');
 }
 
 function rekeyHost(room) {
@@ -294,26 +379,116 @@ function attachHostConn(room, conn) {
   room.conns.set(conn.peer, conn);
   conn.on('open', () => {
     prepChannel(conn);
-    room.labels.set(conn.peer, 'm-' + shortId(conn.peer));
-    refreshMembers(room);
+    broadcastMembers(room);
   });
-  conn.on('data', (d) => onData(room, conn, d));
+  conn.on('data', (d) => enqueueData(room, conn, d));
   conn.on('close', () => {
-    finishReceive(room, conn, true);
-    room.conns.delete(conn.peer);
-    room.labels.delete(conn.peer);
-    refreshMembers(room);
+    cleanupConn(room, conn);
+    // a reconnect may already have replaced this entry
+    if (room.conns.get(conn.peer) === conn) room.conns.delete(conn.peer);
+    broadcastMembers(room);
   });
   conn.on('error', () => { /* 'close' follows */ });
 }
 
-function refreshMembers(room) {
-  room.members = ['host', ...[...room.conns.values()]
-    .filter((c) => c.open)
-    .map((c) => room.labels.get(c.peer) || 'm-' + shortId(c.peer))];
+function broadcastMembers(room) {
+  room.memberCount = 1 + openConns(room).length;
   renderRoom(room);
-  const msg = { type: 'members', list: room.members };
+  // hand every member the peer ids of the others so they can connect directly
+  const peers = [...room.conns.values()].filter((c) => c.open).map((c) => c.peer);
+  const msg = { type: 'members', count: room.memberCount, peers };
   for (const c of room.conns.values()) if (c.open) safeSend(c, msg);
+}
+
+// --------------------------- member mesh -------------------------------
+// The host owns membership; every member then dials the other members so
+// files go straight from sender to receiver instead of relaying through the
+// host. The lower peer id dials, the higher one accepts, so each pair has
+// exactly one connection.
+function attachPeerConn(room, conn) {
+  if (room.destroyed) { try { conn.close(); } catch {} return; }
+  const pid = conn.peer;
+  if (!pid || pid === (room.peer && room.peer.id)) { try { conn.close(); } catch {} return; }
+  if (pid === NS + room.id) { try { conn.close(); } catch {} return; } // already the host link
+  const existing = room.conns.get(pid);
+  if (existing) {
+    if (existing.open) { try { conn.close(); } catch {} return; }
+    room.conns.delete(pid);
+    try { existing.close(); } catch {}
+    cleanupConn(room, existing);
+  }
+  room.conns.set(pid, conn);
+  conn._born = Date.now();
+  conn.on('open', () => prepChannel(conn));
+  conn.on('data', (d) => enqueueData(room, conn, d));
+  conn.on('close', () => {
+    if (room.conns.get(pid) === conn) room.conns.delete(pid);
+    cleanupConn(room, conn);
+  });
+  conn.on('error', () => {
+    if (room.conns.get(pid) === conn) room.conns.delete(pid);
+    cleanupConn(room, conn);
+  });
+}
+
+function connectPeer(room, pid) {
+  if (room.destroyed || !room.peer || !room.peer.open || room.conns.has(pid)) return;
+  let conn;
+  try { conn = room.peer.connect(pid, { reliable: true }); } catch { return; }
+  conn._born = Date.now();
+  room.conns.set(pid, conn);
+  conn.on('open', () => prepChannel(conn));
+  conn.on('data', (d) => enqueueData(room, conn, d));
+  conn.on('close', () => {
+    if (room.conns.get(pid) === conn) room.conns.delete(pid);
+    cleanupConn(room, conn);
+  });
+  conn.on('error', () => {
+    if (room.conns.get(pid) === conn) room.conns.delete(pid);
+    cleanupConn(room, conn);
+  });
+}
+
+function syncPeerList(room, peers) {
+  const self = room.peer && room.peer.id;
+  room.peerList = new Set(peers.filter((p) => typeof p === 'string' && p && p !== self));
+  for (const [pid, conn] of [...room.conns]) {
+    if (!room.peerList.has(pid)) {
+      room.conns.delete(pid);
+      try { conn.close(); } catch {}
+      cleanupConn(room, conn);
+    }
+  }
+  meshTick(room);
+}
+
+function meshTick(room) {
+  if (room.destroyed || room.role !== 'member' || !room.peer || !room.peer.open) return;
+  const self = room.peer.id;
+  if (!self) return;
+  for (const pid of room.peerList) {
+    const existing = room.conns.get(pid);
+    if (existing) {
+      if (existing.open) continue;
+      if (Date.now() - (existing._born || 0) < 15000) continue; // still dialing
+      room.conns.delete(pid);
+      try { existing.close(); } catch {}
+      cleanupConn(room, existing);
+    }
+    if (self < pid) connectPeer(room, pid);
+  }
+}
+
+// a peer instance is per-room; rebuilding it invalidates every conn it owns
+function clearPeerConns(room) {
+  const all = [...room.conns.values()];
+  if (room.conn) all.push(room.conn);
+  room.conns.clear();
+  room.conn = null;
+  for (const c of all) {
+    try { c.close(); } catch {} // handlers may skip on purpose: room.conn was nulled
+    cleanupConn(room, c);
+  }
 }
 
 // ------------------------------ member ---------------------------------
@@ -328,54 +503,58 @@ function createMember(id, folder, restored) {
     if (room.peer.destroyed) { scheduleRevive(room, 'connection lost'); return; }
     if (room.peer.open) connectHost(room);
   }, RETRY_MS);
+  // keep the member-to-member mesh alive (retries failed dials)
+  room.meshTimer = setInterval(() => meshTick(room), 5000);
   startWatchdog(room);
   renderRoom(room);
   saveRooms();
 }
 
 function spawnMemberPeer(room) {
+  clearPeerConns(room);
   const peer = new Peer(PEER_OPTS);
   room.peer = peer;
   room.bornAt = performance.now();
   peer.on('open', () => {
     if (!(room.conn && room.conn.open)) connectHost(room);
   });
+  peer.on('connection', (conn) => attachPeerConn(room, conn));
   peer.on('disconnected', () => scheduleReconnect(room));
   peer.on('error', (err) => {
     if (err.type === 'peer-unavailable') {
-      setStatus(room, 'Host offline, retrying...');
+      setConn(room, 'Host offline, retrying...', 'warn');
       return;
     }
     if (err.type === 'browser-incompatible') {
-      setStatus(room, 'FATAL: browser lacks WebRTC support');
+      setConn(room, 'FATAL: browser lacks WebRTC support', 'err');
       return;
     }
     if (FATAL_SIGNALING.indexOf(err.type) !== -1) {
       scheduleRevive(room, 'signaling unreachable (' + err.type + ')');
       return;
     }
-    setStatus(room, 'signaling problem (' + err.type + ') — retrying...');
+    setConn(room, 'signaling problem (' + err.type + ') — retrying...', 'warn');
   });
 }
 
 function connectHost(room) {
   if (room.destroyed) return;
   if (room.conn) { try { room.conn.close(); } catch {} room.conn = null; }
-  setStatus(room, 'connecting to host...');
+  setConn(room, 'connecting to host...', 'warn');
   const conn = room.peer.connect(NS + room.id, { reliable: true });
   room.conn = conn;
   conn.on('open', () => {
     if (room.conn !== conn) { try { conn.close(); } catch {} return; } // stale
     prepChannel(conn);
-    setStatus(room, 'connected — drop files below');
+    setLevel(room, 'ok'); // connected — the dropzone says the rest
   });
-  conn.on('data', (d) => onData(room, conn, d));
+  conn.on('data', (d) => enqueueData(room, conn, d));
   conn.on('close', () => {
     if (room.conn !== conn) return; // stale
-    finishReceive(room, conn, true);
+    cleanupConn(room, conn);
     room.conn = null;
-    room.members = [];
-    setStatus(room, 'Host offline, retrying...');
+    room.memberCount = 1;
+    setConn(room, 'Host offline, retrying...', 'warn');
     renderRoom(room);
   });
   conn.on('error', () => { /* peer-unavailable arrives on the peer */ });
@@ -389,7 +568,7 @@ function scheduleReconnect(room) {
     room.reconnectPending = false;
     if (room.destroyed) return;
     try { room.peer.reconnect(); } catch {}
-    setStatus(room, 'signaling reconnecting...');
+    setConn(room, 'signaling reconnecting...', 'warn');
   }, 3000);
 }
 
@@ -399,7 +578,7 @@ function scheduleReconnect(room) {
 function scheduleRevive(room, why) {
   if (room.destroyed || room.revivePending) return;
   room.revivePending = true;
-  setStatus(room, why + ' — rebuilding connection...');
+  setConn(room, why + ' — rebuilding connection...', 'warn');
   setTimeout(() => {
     room.revivePending = false;
     if (room.destroyed) return;
@@ -430,51 +609,180 @@ function prepChannel(conn) {
 }
 
 // --------------------------- file sending ------------------------------
+let batchSeq = 0; // unique folder-batch id (one per drop, shared by all peers)
+
 function queueSend(room, file) {
-  room.sendQueue.push(file);
-  pumpSends(room);
-}
-
-async function pumpSends(room) {
-  if (room.sendBusy || room.destroyed) return;
-  room.sendBusy = true;
-  try {
-    while (room.sendQueue.length && !room.destroyed) {
-      await sendToAll(room, room.sendQueue.shift());
-    }
-  } finally {
-    room.sendBusy = false;
-  }
-}
-
-async function sendToAll(room, file) {
   const targets = openConns(room);
   if (!targets.length) {
-    setStatus(room, 'nobody connected — "' + file.name + '" not sent');
+    setNotice(room, 'nobody connected — "' + file.name + '" not sent', 'warn');
     return;
   }
-  for (let i = 0; i < targets.length; i++) {
-    if (room.destroyed) return;
-    await sendToConn(room, targets[i], file, i + 1, targets.length);
-  }
-  if (!room.destroyed) {
-    setStatus(room, 'sent "' + file.name + '" to ' + targets.length + ' peer(s)');
+  // one transfer item + a per-connection queue entry for every target, so
+  // dropping several files stacks all the items at once
+  for (const conn of targets) {
+    let q = room.sendQueues.get(conn);
+    if (!q) { q = []; room.sendQueues.set(conn, q); }
+    const xf = addXfer(room, '↑', file.name, file.size);
+    xf.conn = conn;
+    xf.state = 'waiting';
+    q.push({ file, xf });
+    pumpConn(room, conn);
   }
 }
 
-async function sendToConn(room, conn, file, idx, total) {
-  const xf = addXfer(room, '↑', file.name, file.size);
-  xf.status = 'sending → ' + labelOf(room, conn) + ' (' + idx + '/' + total + ')';
+// ------------------------- folder sending ------------------------------
+// A folder is one batch: the receiver shows one row, and every file keeps
+// its relative path ("Photos/2024/a.jpg") so the tree is rebuilt intact.
+function queueFolder(room, root, entries) {
+  entries = (entries || []).filter((e) => e && e.file);
+  if (!entries.length) {
+    setNotice(room, 'folder "' + root + '" is empty', 'warn');
+    return;
+  }
+  const targets = openConns(room);
+  if (!targets.length) {
+    setNotice(room, 'nobody connected — folder "' + root + '" not sent', 'warn');
+    return;
+  }
+  const total = entries.reduce((n, e) => n + e.file.size, 0);
+  const bid = 'b' + (++batchSeq);
+  for (const conn of targets) {
+    let q = room.sendQueues.get(conn);
+    if (!q) { q = []; room.sendQueues.set(conn, q); }
+    const xf = addXfer(room, '↑', root + '/', total);
+    xf.conn = conn;
+    xf.state = 'waiting';
+    xf.batchId = bid;
+    xf.batchName = root;
+    xf.filesTotal = entries.length;
+    xf.filesDone = 0;
+    q.push({ batch: { root, entries, bid }, xf });
+    pumpConn(room, conn);
+  }
+}
+
+// drag/drop may contain folders; the entry API has to be read before any
+// await, otherwise the DataTransfer is neutered
+function queueDrop(room, dt) {
+  const items = dt.items ? Array.from(dt.items) : [];
+  const picked = [];
+  if (items.length && items[0].webkitGetAsEntry) {
+    for (const it of items) {
+      if (it.kind !== 'file') continue;
+      picked.push({
+        entry: it.webkitGetAsEntry ? it.webkitGetAsEntry() : null,
+        file: it.getAsFile ? it.getAsFile() : null,
+      });
+    }
+  } else {
+    for (const f of dt.files || []) picked.push({ entry: null, file: f });
+  }
+  (async () => {
+    try {
+      for (const p of picked) {
+        if (p.entry && p.entry.isDirectory) {
+          const entries = [];
+          await walkEntry(p.entry, '', entries);
+          queueFolder(room, p.entry.name, entries);
+        } else {
+          const f = p.file || (p.entry && await entryFile(p.entry));
+          if (f) queueSend(room, f);
+        }
+      }
+    } catch (err) {
+      setNotice(room, 'could not read that drop: ' + (err && err.message ? err.message : err), 'err');
+    }
+  })();
+}
+
+function entryFile(entry) {
+  return new Promise((resolve) => entry.file(resolve, () => resolve(null)));
+}
+
+async function walkEntry(entry, rel, out) {
+  if (entry.isFile) {
+    const file = await entryFile(entry);
+    if (file) out.push({ file, rel: rel || file.name });
+    return;
+  }
+  if (!entry.isDirectory) return;
+  const reader = entry.createReader();
+  const children = [];
+  for (;;) {
+    const batch = await new Promise((resolve) =>
+      reader.readEntries(resolve, () => resolve([])));
+    if (!batch.length) break;
+    children.push(...batch);
+  }
+  for (const child of children) {
+    await walkEntry(child, rel ? rel + '/' + child.name : child.name, out);
+  }
+}
+
+// <input webkitdirectory> gives every file a "Root/sub/file" relative path
+function sendPickedFolder(room, files) {
+  const groups = new Map();
+  for (const f of files) {
+    const parts = String(f.webkitRelativePath || f.name)
+      .replace(/\\/g, '/').split('/').filter(Boolean);
+    if (!parts.length) continue;
+    const root = parts.shift();
+    const rel = parts.join('/') || f.name;
+    let g = groups.get(root);
+    if (!g) { g = []; groups.set(root, g); }
+    g.push({ file: f, rel });
+  }
+  for (const [root, entries] of groups) queueFolder(room, root, entries);
+}
+
+// each connection gets its own sequential pump: the meta → chunks → done
+// protocol must never interleave on one data channel
+async function pumpConn(room, conn) {
+  if (room.sending.has(conn)) return;
+  room.sending.add(conn);
+  try {
+    const q = room.sendQueues.get(conn);
+    while (q && q.length && !room.destroyed && conn.open) {
+      const item = q.shift();
+      const xf = item.xf;
+      if (xf.cancelled) continue; // cancelled while still waiting in queue
+      try {
+        if (item.batch) await sendBatchToConn(room, conn, item.batch, xf);
+        else await sendToConn(room, conn, item.file, xf);
+      } catch {
+        xf.state = 'failed';
+        xf.note = 'transfer error';
+        if (!xf.doneAt) xf.doneAt = performance.now();
+      }
+    }
+  } finally {
+    room.sending.delete(conn);
+  }
+}
+
+async function sendToConn(room, conn, file, xf) {
+  room.sendingByConn.set(conn, xf);
+  xf.state = 'active';
   if (!safeSend(conn, { type: 'meta', name: file.name, size: file.size })) {
-    xf.status = 'failed (connection closed)';
+    xf.state = 'failed';
+    xf.note = 'failed — connection closed';
     xf.doneAt = performance.now();
+    room.sendingByConn.delete(conn);
     return;
   }
   let offset = 0;
   while (offset < file.size) {
+    if (xf.cancelled) {
+      // cancelTransfer already put a { type: 'cancel' } on the wire
+      removeXfer(room, xf);
+      room.sendingByConn.delete(conn);
+      return;
+    }
     if (room.destroyed || !conn.open) {
-      xf.status = 'aborted';
-      xf.doneAt = performance.now();
+      xf.state = 'failed';
+      xf.note = 'connection closed';
+      if (!xf.doneAt) xf.doneAt = performance.now();
+      room.sendingByConn.delete(conn);
       return;
     }
     const buf = await file.slice(offset, offset + CHUNK).arrayBuffer(); // never whole file in RAM
@@ -483,9 +791,67 @@ async function sendToConn(room, conn, file, idx, total) {
     offset += buf.byteLength;
     xf.bytes = offset;
   }
+  if (xf.cancelled) { removeXfer(room, xf); room.sendingByConn.delete(conn); return; }
   safeSend(conn, { type: 'done' });
-  xf.status = 'done (' + fmtBytes(file.size) + ')';
-  xf.doneAt = performance.now();
+  xf.bytes = file.size;
+  xf.state = 'done';
+  xf.doneAt = performance.now(); // item lingers 2 s, then the ticker prunes it
+  room.sendingByConn.delete(conn);
+  if (!room.destroyed) setNotice(room, 'sent "' + file.name + '"', 'ok');
+}
+
+async function sendBatchToConn(room, conn, batch, xf) {
+  room.sendingByConn.set(conn, xf);
+  xf.state = 'active';
+  for (const entry of batch.entries) {
+    if (xf.cancelled) { removeXfer(room, xf); room.sendingByConn.delete(conn); return; }
+    if (room.destroyed || !conn.open) {
+      xf.state = 'failed';
+      xf.note = 'connection closed';
+      if (!xf.doneAt) xf.doneAt = performance.now();
+      room.sendingByConn.delete(conn);
+      return;
+    }
+    const wire = batch.root + '/' + entry.rel;
+    if (!safeSend(conn, {
+      type: 'meta', name: wire, size: entry.file.size,
+      bid: batch.bid, batch: batch.root,
+      bsize: xf.size, count: batch.entries.length,
+    })) {
+      xf.state = 'failed';
+      xf.note = 'failed — connection closed';
+      xf.doneAt = performance.now();
+      room.sendingByConn.delete(conn);
+      return;
+    }
+    let offset = 0;
+    while (offset < entry.file.size) {
+      if (xf.cancelled) { removeXfer(room, xf); room.sendingByConn.delete(conn); return; }
+      if (room.destroyed || !conn.open) {
+        xf.state = 'failed';
+        xf.note = 'connection closed';
+        if (!xf.doneAt) xf.doneAt = performance.now();
+        room.sendingByConn.delete(conn);
+        return;
+      }
+      const buf = await entry.file.slice(offset, offset + CHUNK).arrayBuffer();
+      await drain(conn);
+      safeSend(conn, buf);
+      offset += buf.byteLength;
+      xf.bytes += buf.byteLength;
+    }
+    if (xf.cancelled) { removeXfer(room, xf); room.sendingByConn.delete(conn); return; }
+    safeSend(conn, { type: 'done' });
+    xf.filesDone = (xf.filesDone || 0) + 1;
+  }
+  safeSend(conn, { type: 'batch-end', bid: batch.bid });
+  xf.bytes = xf.size;
+  xf.state = 'done';
+  xf.doneAt = performance.now(); // item lingers 2 s, then the ticker prunes it
+  room.sendingByConn.delete(conn);
+  if (!room.destroyed) {
+    setNotice(room, 'sent folder "' + batch.root + '" (' + batch.entries.length + ' files)', 'ok');
+  }
 }
 
 // pause while the data channel holds > BUF_HIGH bytes; resume on
@@ -509,16 +875,30 @@ function drain(conn) {
   });
 }
 
-function labelOf(room, conn) {
-  if (room.role === 'member') return 'host';
-  return room.labels.get(conn.peer) || 'm-' + shortId(conn.peer);
-}
-
 // -------------------------- file receiving -----------------------------
 function isBinary(d) {
   return d instanceof ArrayBuffer ||
          ArrayBuffer.isView(d) ||
          (typeof Blob !== 'undefined' && d instanceof Blob);
+}
+
+// PeerJS fires 'data' in order, but onData() awaits (Blob reassembly, disk
+// writes). Without serializing, a 'done' or the next file's 'meta' could be
+// handled while earlier chunks were still pending, truncating the file or
+// mixing two transfers. One promise chain per connection keeps wire order.
+function enqueueData(room, conn, data) {
+  const prev = room.recvChains.get(conn) || Promise.resolve();
+  const next = prev
+    .then(() => onData(room, conn, data))
+    .catch((err) => {
+      if (!room.destroyed) {
+        setNotice(room, 'transfer error: ' + (err && err.message ? err.message : err), 'err');
+      }
+    });
+  room.recvChains.set(conn, next);
+  next.then(() => {
+    if (room.recvChains.get(conn) === next) room.recvChains.delete(conn);
+  });
 }
 
 async function onData(room, conn, data) {
@@ -536,90 +916,399 @@ async function onData(room, conn, data) {
       return;
     }
     if (data && typeof data === 'object') {
-      if (data.type === 'members') { room.members = data.list || []; renderRoom(room); return; }
+      if (data.type === 'members') {
+        // only the host defines membership; members use the list to mesh up
+        if (conn !== room.conn) return;
+        room.memberCount = Number(data.count) || 1;
+        if (Array.isArray(data.peers)) syncPeerList(room, data.peers);
+        renderRoom(room);
+        return;
+      }
       if (data.type === 'meta')    { await startReceive(room, conn, data); return; }
-      if (data.type === 'done')    { await finishReceive(room, conn, false); return; }
+      if (data.type === 'done')    { await finishReceive(room, conn); return; }
+      if (data.type === 'batch-end') { finishBatch(room, conn, data.bid); return; }
+      if (data.type === 'cancel') {
+        // the peer cancelled a transfer; the direction tells us which one:
+        //   dir '↑' → their outgoing (our incoming)
+        //   dir '↓' → their incoming (our outgoing)
+        if (data.bid) {
+          // folder batch: cancel exactly that batch, not whatever is active
+          if (data.dir !== '↓') await abortBatch(room, conn, data.bid, 'cancelled by peer');
+          if (data.dir !== '↑') {
+            const out = room.sendingByConn.get(conn);
+            if (out && out.batchId === data.bid) {
+              out.cancelled = true;
+              removeXfer(room, out);
+            }
+          }
+          return;
+        }
+        if (data.dir !== '↓') await abortIncoming(room, conn, 'cancelled by peer');
+        if (data.dir !== '↑') {
+          const out = room.sendingByConn.get(conn);
+          if (out) {
+            out.cancelled = true;
+            removeXfer(room, out);
+          }
+        }
+        return;
+      }
     }
   } catch (err) {
-    setStatus(room, 'transfer error: ' + (err && err.message ? err.message : err));
+    setNotice(room, 'transfer error: ' + (err && err.message ? err.message : err), 'err');
   }
 }
 
+// wire path -> safe parts: no "", ".", "..", ":" and never a drive root
+function sanitizeParts(path) {
+  return String(path || '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter((p) => p && p !== '.' && p !== '..' && p.indexOf(':') === -1);
+}
+
+async function entryExists(dir, name) {
+  try { await dir.getFileHandle(name); return true; } catch {}
+  try { await dir.getDirectoryHandle(name); return true; } catch {}
+  return false;
+}
+
+// first free slot: "a.txt", "a (1).txt", ...
+async function uniqueName(dir, name) {
+  let cand = name;
+  if (!(await entryExists(dir, cand))) return cand;
+  const dot = name.lastIndexOf('.');
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '';
+  for (let i = 1; ; i++) {
+    cand = base + ' (' + i + ')' + ext;
+    if (!(await entryExists(dir, cand))) return cand;
+  }
+}
+
+// folder roots also reserve the name in memory, so two peers sending
+// "Photos" at the same time cannot both pick the same directory
+async function uniqueDirName(dir, name, reserved) {
+  const dot = name.lastIndexOf('.');
+  const base = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '';
+  let cand = name;
+  let i = 0;
+  while (reserved.has(cand) || await entryExists(dir, cand)) {
+    i++;
+    cand = base + ' (' + i + ')' + ext;
+  }
+  reserved.add(cand);
+  return cand;
+}
+
+// remove a partial incoming folder; safe on a tree that was never created
+async function dropBatchTree(b) {
+  if (!b || !b.parent || !b.actualRoot) return;
+  try { await b.parent.removeEntry(b.actualRoot, { recursive: true }); } catch {}
+  b.dirHandle = null;
+}
+
 async function startReceive(room, conn, meta) {
-  const name = String(meta.name || 'unnamed').split(/[\\/]/).pop() || 'unnamed';
+  const parts = sanitizeParts(meta.name);
+  const name = parts.length ? parts[parts.length - 1] : 'unnamed';
   const size = Number(meta.size) || 0;
-  const st = { name, size, bytes: 0, writable: null, chunks: null, open: true };
-  st.xf = addXfer(room, '↓', name, size);
+  const bid = typeof meta.bid === 'string' && meta.bid ? meta.bid : null;
+
+  // ---------- folder batch ----------
+  let b = null;
+  if (bid) {
+    b = room.recvBatches.get(conn) || null;
+    if (b && b.bid !== bid) b = null; // a new folder started
+    if (!b) {
+      b = {
+        bid,
+        root: sanitizeParts(meta.batch)[0] || parts[0] || 'folder',
+        total: Number(meta.bsize) || 0,
+        bytes: 0,
+        filesDone: 0,
+        filesTotal: Number(meta.count) || 0,
+        xf: null,
+        parent: null,     // output directory handle
+        dirHandle: null,  // the unique folder we created for this batch
+        actualRoot: null, // its name on disk ("Photos (1)")
+        cancelled: false,
+        noticeShown: false,
+      };
+      room.recvBatches.set(conn, b);
+    }
+    if (b.cancelled) {
+      // late bytes for a folder we already dropped: absorb them silently
+      const dead = {
+        name, size, bytes: 0, writable: null, chunks: null,
+        pending: [], open: true, drop: true, batch: b,
+      };
+      room.recvStates.set(conn, dead);
+      return;
+    }
+  }
+
+  const st = {
+    name, size, bytes: 0,
+    writable: null,
+    chunks: null,   // download-mode buffer
+    pending: [],    // chunks that arrive before the writable handle is ready
+    open: true,
+    drop: false,
+    batch: b,
+    rel: b ? parts.slice(1) : parts,
+  };
+  if (b) {
+    if (!b.xf) {
+      b.xf = addXfer(room, '↓', b.root + '/', b.total || size);
+      b.xf.conn = conn;
+      b.xf.batchId = b.bid;
+      b.xf.batchName = b.root;
+      b.xf.filesTotal = b.filesTotal;
+      b.xf.filesDone = 0;
+    }
+    b.xf.state = 'active';
+    st.xf = b.xf;
+  } else {
+    st.xf = addXfer(room, '↓', name, size);
+    st.xf.conn = conn;
+    st.xf.state = 'active';
+  }
+  // register BEFORE the awaits below — chunks can arrive immediately
   room.recvStates.set(conn, st);
 
   const dir = roomFolders.get(room.id);
+  const canStream = !!(window.showDirectoryPicker && dir);
 
-  // no File System Access API → buffer chunks, then a normal browser download
-  if (!window.showDirectoryPicker) {
+  // no output folder (or no File System Access API) → browser download
+  if (!canStream) {
     st.chunks = [];
-    st.xf.status = 'receiving (download mode)';
-    setStatus(room, 'no direct-to-disk API — "' + name + '" will download when done');
-    return;
-  }
-
-  if (!dir) {
-    st.open = false;
-    st.xf.status = 'REFUSED — no output folder selected';
-    st.xf.doneAt = performance.now();
-    room.recvStates.delete(conn);
-    setStatus(room, 'no folder selected — set one with "change folder" and ask for a resend');
+    if (!window.showDirectoryPicker) {
+      const huge = size > 2 * 1024 * 1024 * 1024; // 2 GB: risky in a tab
+      setNotice(room,
+        'no direct-to-disk API — "' + name + '" (' + fmtBytes(size) + ') is buffered in memory' +
+        (huge
+          ? ' and may crash the tab; use Chrome/Edge to stream it straight to disk'
+          : ', then saved through a normal browser download'),
+        huge ? 'warn' : undefined, huge ? 15000 : 6000);
+    } else if (b) {
+      if (!b.noticeShown) {
+        b.noticeShown = true;
+        setNotice(room, 'no output folder — "' + b.root + '" will arrive as separate browser downloads', 'warn', 10000);
+      }
+    } else {
+      setNotice(room, 'no output folder — "' + name + '" will save through a browser download; click "choose output folder" below the dropzone to stream to disk', 'warn', 10000);
+    }
     return;
   }
 
   try {
-    const fh = await dir.getFileHandle(name, { create: true });
-    st.writable = await fh.createWritable(); // streams straight to disk
-    st.xf.status = 'receiving';
+    let targetDir = dir;
+    let targetName = name;
+    if (b) {
+      // pick one folder tree per batch, once, so every file lands in it
+      if (!b.parent) {
+        b.parent = dir;
+        b.actualRoot = await uniqueDirName(dir, b.root, room.recvRoots);
+        b.dirHandle = await dir.getDirectoryHandle(b.actualRoot, { create: true });
+      }
+      targetDir = b.dirHandle;
+      for (const p of parts.slice(1, -1)) {
+        targetDir = await targetDir.getDirectoryHandle(p, { create: true });
+      }
+      targetName = await uniqueName(targetDir, name);
+    }
+    const fh = await targetDir.getFileHandle(targetName, { create: true });
+    const writable = await fh.createWritable(); // streams straight to disk
+    if (!st.open) {
+      try { await writable.abort(); } catch {}
+      if (b) await dropBatchTree(b); // cancelled while we were opening it
+      return;
+    }
+    st.writable = writable;
+    // flush whatever arrived while the handle was opening
+    const pending = st.pending;
+    st.pending = [];
+    for (const buf of pending) await writable.write(buf);
   } catch (err) {
     st.open = false;
-    st.xf.status = 'REFUSED — cannot write file';
+    st.xf.state = 'failed';
+    st.xf.note = 'cannot write file';
     st.xf.doneAt = performance.now();
     room.recvStates.delete(conn);
-    setStatus(room, 'cannot write "' + name + '": ' + (err && err.message ? err.message : err));
+    if (st.batch) {
+      st.batch.cancelled = true;
+      await dropBatchTree(st.batch);
+    }
+    if (conn.open) {
+      const msg = { type: 'cancel', dir: '↓' };
+      if (bid) msg.bid = bid;
+      safeSend(conn, msg);
+    }
+    setNotice(room, 'cannot write "' + name + '": ' + (err && err.message ? err.message : err), 'err', 12000);
   }
 }
 
 async function receiveChunk(room, conn, buf) {
   const st = room.recvStates.get(conn);
-  if (!st || !st.open) return; // stray chunk after an error/abort
+  if (!st || !st.open || st.drop) return; // stray chunk after an error/abort
   st.bytes += buf.byteLength;
-  st.xf.bytes = st.bytes;
+  if (st.batch) {
+    if (st.batch.xf) st.batch.xf.bytes = st.batch.bytes + st.bytes;
+  } else {
+    st.xf.bytes = st.bytes;
+  }
   try {
     if (st.writable) await st.writable.write(buf);
     else if (st.chunks) st.chunks.push(buf);
+    else st.pending.push(buf); // writable still being created
   } catch (err) {
     st.open = false;
-    st.xf.status = 'write error';
-    st.xf.doneAt = performance.now();
     room.recvStates.delete(conn);
-    setStatus(room, 'write failed on "' + st.name + '": ' + (err && err.message ? err.message : err));
+    if (st.batch) {
+      st.batch.cancelled = true;
+      await dropBatchTree(st.batch);
+    }
+    if (conn.open) {
+      const msg = { type: 'cancel', dir: '↓' };
+      if (st.batch) msg.bid = st.batch.bid;
+      safeSend(conn, msg); // stop the sender
+    }
+    if (st.writable) { try { await st.writable.abort(); } catch {} st.writable = null; }
+    st.chunks = null;
+    st.pending = [];
+    st.xf.state = 'failed';
+    st.xf.note = 'write error';
+    st.xf.doneAt = performance.now();
+    setNotice(room, 'write failed on "' + st.name + '": ' + (err && err.message ? err.message : err), 'err');
   }
 }
 
-async function finishReceive(room, conn, aborted) {
+async function finishReceive(room, conn) {
   const st = room.recvStates.get(conn);
   if (!st) return;
   room.recvStates.delete(conn);
   st.open = false;
+  if (st.drop) return; // leftovers from a folder we already dropped
   if (st.writable) {
-    try { await st.writable.close(); } catch {
-      st.xf.status = 'close error';
+    // extremely unlikely: a chunk landed while startReceive was flushing
+    for (const buf of st.pending) { try { await st.writable.write(buf); } catch {} }
+    st.pending = [];
+    try {
+      await st.writable.close();
+    } catch {
+      st.xf.state = 'failed';
+      st.xf.note = 'close error';
       st.xf.doneAt = performance.now();
+      if (st.batch) st.batch.cancelled = true;
       return;
     }
     st.writable = null;
   } else if (st.chunks) {
-    downloadBlob(new Blob(st.chunks), st.name); // fallback path
+    // no output folder: one flat download per file, browser adds the (N)
+    const dl = st.batch
+      ? st.batch.root + '_' + (st.rel.join('_') || st.name)
+      : st.name;
+    downloadBlob(new Blob(st.chunks), dl);
     st.chunks = null;
+  } else if (st.pending.length) {
+    downloadBlob(new Blob(st.pending), st.name);
+    st.pending = [];
   }
-  st.xf.status = aborted ? 'aborted (sender left)' : 'done (' + fmtBytes(st.bytes) + ')';
-  st.xf.doneAt = performance.now();
-  setStatus(room, 'received "' + st.name + '" (' + fmtBytes(st.bytes) + (aborted ? ', incomplete' : '') + ')');
+  if (st.batch) {
+    st.batch.bytes += st.bytes;
+    st.batch.filesDone++;
+    if (st.batch.xf) st.batch.xf.bytes = st.batch.bytes;
+    return; // the folder row finishes on { type: 'batch-end' }
+  }
+  st.xf.bytes = st.size || st.bytes;
+  st.xf.state = 'done';
+  st.xf.doneAt = performance.now(); // lingers 2 s, then the ticker prunes it
+  setNotice(room, 'received "' + st.name + '" (' + fmtBytes(st.bytes) + ')', 'ok');
+}
+
+function finishBatch(room, conn, bid) {
+  const b = room.recvBatches.get(conn);
+  if (!b || (bid && b.bid !== bid)) return;
+  room.recvBatches.delete(conn);
+  if (b.cancelled) return;
+  if (b.xf) {
+    b.xf.bytes = b.bytes;
+    b.xf.filesDone = b.filesDone;
+    b.xf.state = 'done';
+    b.xf.doneAt = performance.now(); // lingers 2 s, then the ticker prunes it
+  }
+  setNotice(room, 'received folder "' + b.root + '" (' + b.filesDone + ' files, ' + fmtBytes(b.bytes) + ')', 'ok');
+}
+
+// drop an incoming transfer and discard the partial file on disk
+async function abortIncoming(room, conn, why) {
+  const st = room.recvStates.get(conn);
+  if (!st) return;
+  room.recvStates.delete(conn);
+  st.open = false;
+  st.pending = [];
+  st.chunks = null;
+  if (st.writable) {
+    try { await st.writable.abort(); } catch {} // does not keep the partial
+    st.writable = null;
+  }
+  if (st.xf && !st.batch && st.xf.state !== 'done') {
+    st.xf.state = 'failed';
+    st.xf.note = why || 'cancelled';
+    st.xf.doneAt = performance.now();
+  }
+}
+
+// cancel a whole incoming folder: stop the current file and remove the tree
+async function abortBatch(room, conn, bid, why) {
+  const b = room.recvBatches.get(conn);
+  if (!b || (bid && b.bid !== bid)) return;
+  b.cancelled = true;
+  await abortIncoming(room, conn, why);
+  await dropBatchTree(b);
+  if (b.xf) {
+    b.xf.state = 'failed';
+    b.xf.note = why || 'cancelled';
+    b.xf.doneAt = performance.now();
+  }
+  // keep the record briefly so late metas/chunks for it are swallowed
+  setTimeout(() => {
+    if (room.recvBatches.get(conn) === b) room.recvBatches.delete(conn);
+  }, 30000);
+}
+
+// connection died: fail its queued/active sends and abort any receive
+function cleanupConn(room, conn) {
+  const q = room.sendQueues.get(conn);
+  if (q) {
+    for (const entry of q) {
+      entry.xf.state = 'failed';
+      entry.xf.note = 'connection closed';
+      entry.xf.doneAt = performance.now();
+    }
+    room.sendQueues.delete(conn);
+  }
+  const active = room.sendingByConn.get(conn);
+  if (active) {
+    active.state = 'failed';
+    active.note = 'connection closed';
+    active.doneAt = performance.now();
+  }
+  room.sendingByConn.delete(conn);
+  room.recvChains.delete(conn);
+  const b = room.recvBatches.get(conn);
+  if (b) {
+    room.recvBatches.delete(conn);
+    b.cancelled = true;
+    if (b.xf) {
+      b.xf.state = 'failed';
+      b.xf.note = 'connection closed';
+      b.xf.doneAt = performance.now();
+    }
+  }
+  abortIncoming(room, conn, 'connection closed');
+  if (b) dropBatchTree(b);
 }
 
 function downloadBlob(blob, name) {
@@ -634,38 +1323,119 @@ function downloadBlob(blob, name) {
 }
 
 // ------------------------- progress display ----------------------------
+let xferSeq = 0; // unique transfer ids (DOM lookups are keyed on them)
+
 function addXfer(room, dir, name, size) {
-  const key = dir + name;
-  const old = room.xferEls.get(key);
-  if (old) { old.remove(); room.xferEls.delete(key); }
-  room.xfers.delete(key);
+  const id = (dir === '↑' ? 'up-' : 'down-') + (++xferSeq);
   const xf = {
-    dir, name, size,
-    bytes: 0, speed: 0,
-    status: '',
+    id, dir, name, size,
+    bytes: 0,
+    speed: 0,
+    state: 'active',   // 'waiting' | 'active' | 'done' | 'failed'
+    note: '',
+    cancelled: false,  // set by cancelTransfer / a wire { type: 'cancel' }
+    conn: null,
     tRef: performance.now(), bRef: 0, doneAt: 0,
   };
-  room.xfers.set(key, xf);
+  room.xfers.set(id, xf);
+  // render right away: even a fast transfer must be visible (the ticker
+  // below only picks up items that were added while detached)
+  if (room.progEl && room.progEl.isConnected) {
+    const el = buildTransferItem(room, xf);
+    room.progEl.appendChild(el);
+    room.xferEls.set(id, el);
+  }
   return xf;
 }
 
-function lineFor(xf) {
+// idempotent: safe to call from the pump, the cancel handler and cleanup
+function removeXfer(room, xf) {
+  if (!xf || !room.xfers.has(xf.id)) return;
+  room.xfers.delete(xf.id);
+  const el = room.xferEls.get(xf.id);
+  if (el) { el.remove(); room.xferEls.delete(xf.id); }
+}
+
+function transferStats(xf) {
+  if (xf.state === 'done') return '✓ complete';
+  if (xf.state === 'failed') return '✗ ' + (xf.note || 'failed');
   const pct = xf.size ? Math.min(100, Math.floor((xf.bytes / xf.size) * 100)) : 0;
-  const f = Math.round(pct / 10);
-  const bar = '[' + '#'.repeat(f) + '-'.repeat(10 - f) + ']';
-  const total = xf.size ? ' / ' + fmtBytes(xf.size) : '';
-  const spd = xf.speed > 1 ? ' ' + fmtSpeed(xf.speed) : '';
-  return xf.dir + ' ' + xf.name + ' ' + bar + ' ' + pct + '% — ' +
-         fmtBytes(xf.bytes) + total + spd + ' — ' + xf.status;
+  let text = pct + '% · ' + fmtBytes(xf.bytes) + (xf.size ? ' / ' + fmtBytes(xf.size) : '');
+  if (xf.state === 'waiting') text += ' · queued';
+  else if (xf.speed > 1) text += ' · ' + fmtSpeed(xf.speed);
+  if (xf.filesTotal) text += ' · ' + (xf.filesDone || 0) + '/' + xf.filesTotal + ' files';
+  return text;
+}
+
+function updateTransferItem(xf, el) {
+  const pct = xf.state === 'done'
+    ? 100
+    : (xf.size ? Math.min(100, Math.floor((xf.bytes / xf.size) * 100)) : 0);
+  const fill = el.querySelector('.progress-fill');
+  if (fill) fill.style.width = pct + '%';
+  const stats = el.querySelector('.transfer-stats');
+  if (stats) stats.textContent = transferStats(xf);
+}
+
+function buildTransferItem(room, xf) {
+  const item = h('div');
+  item.className = 'transfer-item';
+
+  const header = h('div');
+  header.className = 'transfer-header';
+  const name = h('span', xf.dir + ' ' + xf.name);
+  name.className = 'file-name';
+  name.title = xf.name;
+  header.appendChild(name);
+
+  const meta = h('span');
+  meta.className = 'transfer-meta';
+  const stats = h('span', transferStats(xf));
+  stats.className = 'transfer-stats';
+  meta.appendChild(stats);
+  const cancel = h('button', '×');
+  cancel.className = 'cancel-btn';
+  cancel.title = 'cancel transfer';
+  cancel.addEventListener('click', () => cancelTransfer(room, xf));
+  meta.appendChild(cancel);
+  header.appendChild(meta);
+  item.appendChild(header);
+
+  const track = h('div');
+  track.className = 'progress-track';
+  const fill = h('div');
+  fill.className = 'progress-fill';
+  track.appendChild(fill);
+  item.appendChild(track);
+
+  updateTransferItem(xf, item);
+  return item;
+}
+
+// cancel exactly one transfer: tell the other side which direction it is,
+// drop the partial file, and remove the item right away
+function cancelTransfer(room, xf) {
+  if (xf.cancelled || xf.state === 'done') return;
+  xf.cancelled = true;
+  if (xf.conn && xf.conn.open) {
+    const msg = { type: 'cancel', dir: xf.dir };
+    if (xf.batchId) msg.bid = xf.batchId;
+    safeSend(xf.conn, msg);
+  }
+  if (xf.dir === '↓') {
+    if (xf.batchId) abortBatch(room, xf.conn, xf.batchId, 'cancelled');
+    else abortIncoming(room, xf.conn, 'cancelled');
+  }
+  removeXfer(room, xf);
 }
 
 setInterval(() => {
   const now = performance.now();
   for (const room of rooms.values()) {
     if (room.destroyed) continue;
-    // rolling speed
+    // rolling speed for active transfers
     for (const xf of room.xfers.values()) {
-      if (xf.doneAt) continue;
+      if (xf.state !== 'active' || xf.doneAt) continue;
       const dt = (now - xf.tRef) / 1000;
       if (dt >= 0.3) {
         xf.speed = (xf.bytes - xf.bRef) / dt;
@@ -673,25 +1443,19 @@ setInterval(() => {
         xf.bRef = xf.bytes;
       }
     }
-    // prune finished lines
-    for (const [key, xf] of room.xfers) {
-      if (xf.doneAt && now - xf.doneAt > 8000) {
-        room.xfers.delete(key);
-        const div = room.xferEls.get(key);
-        if (div) { div.remove(); room.xferEls.delete(key); }
-      }
+    // finished items linger 2 s, then disappear (empty list = no space)
+    for (const xf of [...room.xfers.values()]) {
+      if (xf.doneAt && now - xf.doneAt > 2000) removeXfer(room, xf);
     }
-    // redraw
-    if (room.progEl && room.progEl.isConnected) {
-      for (const [key, xf] of room.xfers) {
-        let div = room.xferEls.get(key);
-        if (!div || !div.isConnected) {
-          div = h('div');
-          room.progEl.appendChild(div);
-          room.xferEls.set(key, div);
-        }
-        div.textContent = lineFor(xf);
+    if (!room.progEl || !room.progEl.isConnected) continue;
+    for (const xf of room.xfers.values()) {
+      let el = room.xferEls.get(xf.id);
+      if (!el || !el.isConnected) {
+        el = buildTransferItem(room, xf);
+        room.progEl.appendChild(el);
+        room.xferEls.set(xf.id, el);
       }
+      updateTransferItem(xf, el);
     }
   }
 }, 300);
@@ -706,31 +1470,40 @@ async function changeFolder(room) {
     return; // user cancelled
   }
   roomFolders.set(room.id, handle);
-  setStatus(room, 'output folder set: ' + handle.name);
+  room.recvRoots.clear(); // names are relative to the new folder
+  setNotice(room, 'output folder set: ' + handle.name);
   renderRoom(room);
 }
 
+// copy an invite link (origin + path #XXXXX) that auto-joins the room when
+// opened; the share button shows "copied!" for 1.5 s (renderRoom reads
+// copiedUntil)
 async function copyId(room) {
-  const id = room.id;
+  const url = window.location.origin + window.location.pathname + '#' + room.id;
+  let ok = true;
   try {
-    await navigator.clipboard.writeText(id);
-    setStatus(room, 'copied ' + id + ' to clipboard');
+    await navigator.clipboard.writeText(url);
   } catch {
     const ta = h('textarea');
-    ta.value = id;
+    ta.value = url;
     document.body.appendChild(ta);
     ta.select();
-    const ok = document.execCommand('copy');
+    ok = document.execCommand('copy');
     ta.remove();
-    setStatus(room, ok ? 'copied ' + id + ' to clipboard' : 'copy failed — room code: ' + id);
   }
+  room.copyOk = ok;
+  room.copiedUntil = Date.now() + 1500;
+  renderRoom(room);
+  setTimeout(() => { if (!room.destroyed) renderRoom(room); }, 1500);
 }
 
 function destroyRoom(room) {
   if (room.destroyed) return;
   room.destroyed = true;
   clearInterval(room.retryTimer);
+  clearInterval(room.meshTimer);
   clearInterval(room.watchdog);
+  clearTimeout(room.noticeTimer);
   for (const c of room.conns.values()) { try { c.close(); } catch {} }
   if (room.conn) { try { room.conn.close(); } catch {} }
   if (room.peer) { try { room.peer.destroy(); } catch {} }
@@ -759,24 +1532,44 @@ document.getElementById('btn-host').addEventListener('click', async () => {
   createHost(genId(), folder, false);
 });
 
-document.getElementById('btn-join').addEventListener('click', async () => {
-  if (typeof Peer === 'undefined') { alert('PeerJS failed to load — check your connection.'); return; }
-  const id = (prompt('Room code (5 characters):') || '').trim().toUpperCase();
-  if (!id) return;
-  if (!/^[A-Z0-9]{5}$/.test(id)) { alert('Room code must be exactly 5 letters/numbers.'); return; }
-  if (rooms.has(id)) { alert('You are already in room ' + id + '.'); return; }
-  const folder = await pickFolder();
-  if (folder === undefined) return;
-  createMember(id, folder, false);
-});
-
 // restore persisted rooms on load (folder handles can't be persisted —
-// set them again with "change folder"; both buttons call the picker
-// directly inside their click handlers)
+// set them again via the footer link; all picker calls stay inside
+// direct click handlers)
 loadRooms();
 
+// The invite link is the only way to join now: opening .../#K7X9Q (or
+// pasting the hash into a tab that is already open) joins that room.
+// The folder picker can't open without a click, so the room starts
+// folderless; "choose output folder" in the card footer sets it later.
+function joinFromHash() {
+  const code = (window.location.hash || '').replace('#', '').trim().toUpperCase();
+  if (!/^[A-Z0-9]{5}$/.test(code)) return;
+  // never leave the code in the address bar: a refresh should not re-join
+  history.replaceState(null, '', window.location.pathname);
+  if (rooms.has(code)) return;            // already in that room
+  if (typeof Peer === 'undefined') return; // PeerJS failed to load
+  createMember(code, null, false);        // createMember() persists the room
+}
+
+if (document.readyState === 'loading') {
+  window.addEventListener('DOMContentLoaded', joinFromHash);
+} else {
+  joinFromHash();
+}
+window.addEventListener('hashchange', joinFromHash);
+
 if (!window.showDirectoryPicker) {
-  compatEl.textContent =
-    'note: this browser lacks the File System Access API (Chrome/Edge have it). ' +
-    'Incoming files will be saved through normal browser downloads instead.';
+  if (IS_FIREFOX) {
+    compatEl.className = 'compat-warn';
+    compatEl.textContent =
+      'warning: Firefox cannot stream incoming files straight to disk. They are buffered ' +
+      'in memory and then downloaded, so large files (multi-GB) may crash the tab — use ' +
+      'Chrome or Edge for big transfers.';
+  } else {
+    compatEl.textContent =
+      'note: this browser lacks the File System Access API (Chrome/Edge have it). ' +
+      'Incoming files are buffered in memory and then saved through a normal browser ' +
+      'download, so very large files can run out of memory. Chrome/Edge stream straight ' +
+      'to a folder you pick instead.';
+  }
 }

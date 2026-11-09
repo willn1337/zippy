@@ -4,23 +4,172 @@ body {
   line-height: 1.6;
   font-size: 16px;
   padding: 0 10px;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+h1, h4 {
+  text-align: center;
 }
 
 .room-box {
-  border: 2px solid #000;
-  padding: 15px;
+  border: 1px solid;
+  padding: 20px;
   margin: 15px 0;
 }
 .drop-zone {
-  border: 2px dashed #666;
+  border: 1px dashed;
   padding: 20px;
-  text-align: center;
-  margin-top: 10px;
-  background: #fafafa;
-}
-.hidden-id {
-  filter: blur(4px);
+  min-height: 100px;
+  margin: 16px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: center;
+  justify-content: center;
+  background: #ebebeb;
   cursor: pointer;
-  user-select: none;
 }
-.hidden-id:hover { filter: none; }
+.drop-sub {
+  font-size: 0.8em;
+  opacity: 0.7;
+}
+.drop-sub:hover {
+  text-decoration: underline;
+  opacity: 1;
+}
+/* room card internals */
+.room-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.room-box .share-btn {
+  font-size: 13px;
+  padding: 2px 8px;
+  cursor: pointer;
+  margin-left: 6px;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9em;
+  opacity: 0.75;
+}
+.room-box button {
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.room-box .close-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  align-self: center; /* Stops flexbox from stretching it vertically */
+  flex-shrink: 0;     /* Prevents it from getting squished */
+}
+
+
+/* non-connection messages (folder/transfer info) — the dot is connection-only */
+.room-notice {
+  font-size: 0.9em;
+  margin-top: 6px;
+  opacity: 0.75;
+}
+.room-notice:empty { display: none; }
+.room-notice.err { color: #cf222e; opacity: 1; }
+.room-notice.warn { color: #9a6700; opacity: 1; }
+.room-notice.ok { color: #1a7f37; opacity: 1; }
+
+.room-footer {
+  font-size: 0.9em;
+}
+.room-footer span { opacity: 0.9; }
+.folder-link { cursor: pointer; }
+.folder-link:hover .folder-text {
+  color: #000;
+  text-decoration: underline;
+  opacity: 1;
+}
+
+.actions {
+  text-align: center;
+}
+.actions button {
+  font-size: 16px;
+  padding: 8px 24px;
+  cursor: pointer;
+}
+
+/* ------------------------- transfer list ------------------------- */
+.transfers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 14px 0;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.transfer-item { font-size: 13px; }
+.transfer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.file-name {
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 60%;
+}
+.transfer-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  opacity: 0.75;
+}
+.cancel-btn {
+  border: none;
+  background: none;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 3px;
+}
+.cancel-btn:hover { background: #fee2e2; color: #dc2626; }
+.progress-track {
+  width: 100%;
+  height: 3px;
+  background: #e5e5e5;
+  border-radius: 2px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: #000;
+  width: 0%;
+  transition: width 0.1s linear;
+}
+/* empty list must not take vertical space */
+.transfers-list:empty { display: none; }
+/* .room-box button resets padding/font with higher specificity — keep the
+   cancel button's own metrics (see .room-box button above) */
+.room-box .cancel-btn {
+  font-size: 16px;
+  padding: 0 4px;
+}
+
+/* Firefox / browsers without the File System Access API */
+.compat-warn { color: #9a6700; }
