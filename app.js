@@ -12,6 +12,9 @@
        3) { type: 'done' }                 JSON object
    - backpressure: pause when dataChannel.bufferedAmount > 1 MB, resume
      on the 'bufferedamountlow' event
+   - resilience: signaling loss (VPN, offline, firewall) is FATAL in
+     PeerJS — a watchdog + fatal-error handler rebuild the peer until
+     signaling comes back
    ======================================================================= */
 
 // ------------------------------ config ---------------------------------
@@ -26,6 +29,9 @@ const PEER_OPTS = {
   debug: 1,
   config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] },
 };
+// PeerJS treats these signaling errors as fatal (peer destroyed) —
+// the only cure is building a fresh peer instance
+const FATAL_SIGNALING = ['network', 'socket-error', 'socket-closed-error', 'server-error', 'ssl-unavailable'];
 
 // ------------------------------ state ----------------------------------
 const rooms = new Map();        // roomId -> room record
@@ -107,7 +113,10 @@ function baseRoom(id, role, restored) {
     sendQueue: [],
     sendBusy: false,
     retryTimer: 0,
+    watchdog: 0,
     reconnectPending: false,
+    revivePending: false,
+    bornAt: 0,              // performance.now() of the last peer spawn
     spawnTries: 0,
     status: 'Starting...',
     statusEl: null,
@@ -217,6 +226,7 @@ function createHost(id, folder, restored) {
   if (folder) roomFolders.set(id, folder);
   room.status = 'registering on signaling server...';
   spawnHostPeer(room);
+  startWatchdog(room);
   renderRoom(room);
   saveRooms();
 }
@@ -224,6 +234,7 @@ function createHost(id, folder, restored) {
 function spawnHostPeer(room) {
   const peer = new Peer(NS + room.id, PEER_OPTS);
   room.peer = peer;
+  room.bornAt = performance.now();
   peer.on('open', () => {
     setStatus(room, 'host online — share the room code');
   });
@@ -256,6 +267,10 @@ function hostError(room, err) {
   if (err.type === 'peer-unavailable') return; // stale offer, ignore
   if (err.type === 'browser-incompatible') {
     setStatus(room, 'FATAL: browser lacks WebRTC support');
+    return;
+  }
+  if (FATAL_SIGNALING.indexOf(err.type) !== -1) {
+    scheduleRevive(room, 'signaling unreachable (' + err.type + ')');
     return;
   }
   setStatus(room, 'signaling problem (' + err.type + ') — retrying...');
@@ -306,8 +321,22 @@ function createMember(id, folder, restored) {
   const room = baseRoom(id, 'member', restored);
   if (folder) roomFolders.set(id, folder);
   room.status = 'connecting to signaling server...';
+  spawnMemberPeer(room);
+  // persistent retry: if the host is not online, keep trying every 30 s
+  room.retryTimer = setInterval(() => {
+    if (room.destroyed || (room.conn && room.conn.open)) return;
+    if (room.peer.destroyed) { scheduleRevive(room, 'connection lost'); return; }
+    if (room.peer.open) connectHost(room);
+  }, RETRY_MS);
+  startWatchdog(room);
+  renderRoom(room);
+  saveRooms();
+}
+
+function spawnMemberPeer(room) {
   const peer = new Peer(PEER_OPTS);
   room.peer = peer;
+  room.bornAt = performance.now();
   peer.on('open', () => {
     if (!(room.conn && room.conn.open)) connectHost(room);
   });
@@ -321,16 +350,12 @@ function createMember(id, folder, restored) {
       setStatus(room, 'FATAL: browser lacks WebRTC support');
       return;
     }
+    if (FATAL_SIGNALING.indexOf(err.type) !== -1) {
+      scheduleRevive(room, 'signaling unreachable (' + err.type + ')');
+      return;
+    }
     setStatus(room, 'signaling problem (' + err.type + ') — retrying...');
   });
-  // persistent retry: if the host is not online, keep trying every 30 s
-  room.retryTimer = setInterval(() => {
-    if (room.destroyed || (room.conn && room.conn.open)) return;
-    if (room.peer.disconnected) { try { room.peer.reconnect(); } catch {} return; }
-    if (room.peer.open) connectHost(room);
-  }, RETRY_MS);
-  renderRoom(room);
-  saveRooms();
 }
 
 function connectHost(room) {
@@ -366,6 +391,37 @@ function scheduleReconnect(room) {
     try { room.peer.reconnect(); } catch {}
     setStatus(room, 'signaling reconnecting...');
   }, 3000);
+}
+
+// PeerJS marks signaling failures (VPN, firewall, offline) as FATAL: the
+// Peer instance is destroyed and reconnect() can't save it. The only cure
+// is building a fresh peer. scheduleRevive does that, throttled to 5 s.
+function scheduleRevive(room, why) {
+  if (room.destroyed || room.revivePending) return;
+  room.revivePending = true;
+  setStatus(room, why + ' — rebuilding connection...');
+  setTimeout(() => {
+    room.revivePending = false;
+    if (room.destroyed) return;
+    try { room.peer && room.peer.destroy(); } catch {}
+    if (room.role === 'host') spawnHostPeer(room);
+    else spawnMemberPeer(room);
+    renderRoom(room);
+  }, 5000);
+}
+
+// safety net for signaling that stalls WITHOUT ever erroring (some VPN
+// proxies just hang the websocket): if the peer hasn't opened within
+// 20 s, tear it down and build a fresh one
+function startWatchdog(room) {
+  room.watchdog = setInterval(() => {
+    if (room.destroyed || room.peer.open) return;
+    if (room.peer.destroyed) { scheduleRevive(room, 'connection lost'); return; }
+    if (room.peer.disconnected) { try { room.peer.reconnect(); } catch {} return; }
+    if (performance.now() - room.bornAt > 20000) {
+      scheduleRevive(room, 'signaling unreachable');
+    }
+  }, 10000);
 }
 
 function prepChannel(conn) {
@@ -674,6 +730,7 @@ function destroyRoom(room) {
   if (room.destroyed) return;
   room.destroyed = true;
   clearInterval(room.retryTimer);
+  clearInterval(room.watchdog);
   for (const c of room.conns.values()) { try { c.close(); } catch {} }
   if (room.conn) { try { room.conn.close(); } catch {} }
   if (room.peer) { try { room.peer.destroy(); } catch {} }
