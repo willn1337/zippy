@@ -77,16 +77,16 @@ h1, h4 {
 }
 
 
-/* non-connection messages (folder/transfer info) — the dot is connection-only */
-.room-notice {
+/* the one status line (transfer results, folder info) — the dot is connection-only */
+.room-status {
   font-size: 0.9em;
   margin-top: 6px;
   opacity: 0.75;
 }
-.room-notice:empty { display: none; }
-.room-notice.err { color: #cf222e; opacity: 1; }
-.room-notice.warn { color: #9a6700; opacity: 1; }
-.room-notice.ok { color: #1a7f37; opacity: 1; }
+.room-status:empty { display: none; }
+.room-status.err { color: #cf222e; opacity: 1; }
+.room-status.warn { color: #9a6700; opacity: 1; }
+.room-status.ok { color: #1a7f37; opacity: 1; }
 
 .room-footer {
   font-size: 0.9em;
