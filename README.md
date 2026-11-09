@@ -1,5 +1,7 @@
 # zippy
 
+https://willn1337.github.io/zippy/
+
 easy p2p file sharing for you and friends
 
 1. host a room
